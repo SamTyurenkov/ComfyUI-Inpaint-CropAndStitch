@@ -297,6 +297,33 @@ def pad_to_multiple(value, multiple):
     return int(math.ceil(value / multiple) * multiple)
 
 
+def find_best_wan_resolution(mask_width, mask_height):
+    """
+    Find the minimal predefined resolution that can fit the mask.
+    Returns (width, height) or None if mask doesn't fit any resolution.
+    """
+    # Predefined resolutions sorted by total pixels (ascending)
+    resolutions = [
+        (320, 320),
+        (480, 480),      # 230,400
+        (720, 720),      # 518,400
+        (768, 768),      # 589,824
+        (1024, 720),     # 737,280
+        (1024, 768),     # 786,432
+        (1024, 1024),    # 1,048,576
+        (1440, 720),     # 1,036,800
+        (1440, 768),     # 1,105,920
+        (1440, 1024),    # 1,474,560
+        (1440, 1440),    # 2,073,600
+    ]
+    
+    for res_w, res_h in resolutions:
+        if mask_width <= res_w and mask_height <= res_h:
+            return (res_w, res_h)
+    
+    return None
+
+
 def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscale_algorithm, upscale_algorithm):
     image = image.clone()
     mask = mask.clone()
@@ -521,7 +548,7 @@ class InpaintCropImproved:
                 "context_from_mask_extend_factor": ("FLOAT", {"default": 1.2, "min": 1.0, "max": 100.0, "step": 0.01, "tooltip": "Grow the context area from the mask by a certain factor in every direction. For example, 1.5 grabs extra 50% up, down, left, and right as context."}),
 
                 # Output
-                "output_resize_to_target_size": ("BOOLEAN", {"default": True, "tooltip": "Force a specific resolution for sampling."}),
+                "output_mode": (["no_resize", "resize_to_target", "wan_target"], {"default": "resize_to_target", "tooltip": "Output mode: no_resize keeps original size, resize_to_target forces specific resolution, wan_target picks best predefined resolution"}),
                 "output_target_width": ("INT", {"default": 512, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 1}),
                 "output_target_height": ("INT", {"default": 512, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 1}),
                 "output_padding": (["0", "8", "16", "32", "64", "128", "256", "512"], {"default": "32"}),
@@ -602,7 +629,7 @@ class InpaintCropImproved:
     #'''
 
  
-    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask=None, optional_context_mask=None):
+    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_mode, output_target_width, output_target_height, output_padding, mask=None, optional_context_mask=None):
         image = image.clone()
         if mask is not None:
             mask = mask.clone()
@@ -710,7 +737,7 @@ class InpaintCropImproved:
                 preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height,
                 extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor,
                 mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels,
-                context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height,
+                context_from_mask_extend_factor, output_mode, output_target_width, output_target_height,
                 output_padding, one_mask, one_optional_context_mask)
 
             stitcher, cropped_image, cropped_mask = outputs[:3]
@@ -741,7 +768,7 @@ class InpaintCropImproved:
         return result_stitcher, result_image, result_mask, *[debug_outputs[name] for name in self.RETURN_NAMES if name.startswith("DEBUG_")]
 
 
-    def inpaint_crop_single_image(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask, optional_context_mask):
+    def inpaint_crop_single_image(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_mode, output_target_width, output_target_height, output_padding, mask, optional_context_mask):
         if preresize:
             image, mask, optional_context_mask = preresize_imm(image, mask, optional_context_mask, downscale_algorithm, upscale_algorithm, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height)
         if self.DEBUG_MODE:
@@ -809,9 +836,20 @@ class InpaintCropImproved:
             DEBUG_context_with_context_mask = context.clone()
             DEBUG_context_with_context_mask_location = debug_context_location_in_image(image, x, y, w, h)
 
-        if not output_resize_to_target_size:
+        if output_mode == "no_resize":
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, w, h, output_padding, downscale_algorithm, upscale_algorithm)
-        else: # if output_resize_to_target_size:
+        elif output_mode == "wan_target":
+            # Find the minimal predefined resolution that fits the context area (w, h)
+            # The context area already includes extend_factor growth from growcontextarea_m
+            best_resolution = find_best_wan_resolution(w, h)
+            if best_resolution is None:
+                # Mask doesn't fit any predefined resolution, use original size
+                target_w, target_h = w, h
+            else:
+                target_w, target_h = best_resolution
+            # Pass padding=0 because predefined resolutions should be used as-is, without additional padding
+            canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, target_w, target_h, 0, downscale_algorithm, upscale_algorithm)
+        else: # output_mode == "resize_to_target"
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, output_target_width, output_target_height, output_padding, downscale_algorithm, upscale_algorithm)
         if self.DEBUG_MODE:
             DEBUG_context_to_target = context.clone()
