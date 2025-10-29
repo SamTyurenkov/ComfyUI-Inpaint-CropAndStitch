@@ -297,9 +297,31 @@ def pad_to_multiple(value, multiple):
     return int(math.ceil(value / multiple) * multiple)
 
 
+def calculate_adjusted_context_dimensions(w, h, target_w, target_h):
+    """
+    Calculate what dimensions the context area will have after crop_magic_im
+    adjusts it to match the target aspect ratio.
+    Returns (adjusted_w, adjusted_h).
+    """
+    target_aspect_ratio = target_w / target_h
+    context_aspect_ratio = w / h
+    
+    if context_aspect_ratio < target_aspect_ratio:
+        # Will grow width to meet aspect ratio
+        adjusted_w = int(h * target_aspect_ratio)
+        adjusted_h = h
+    else:
+        # Will grow height to meet aspect ratio
+        adjusted_w = w
+        adjusted_h = int(w / target_aspect_ratio)
+    
+    return adjusted_w, adjusted_h
+
+
 def find_best_wan_resolution(mask_width, mask_height):
     """
-    Find the minimal predefined resolution that can fit the mask.
+    Find the minimal predefined resolution that can fit the mask,
+    accounting for aspect ratio adjustments.
     Returns (width, height) or None if mask doesn't fit any resolution.
     """
     # Predefined resolutions sorted by total pixels (ascending)
@@ -308,6 +330,8 @@ def find_best_wan_resolution(mask_width, mask_height):
         (480, 480),      # 230,400
         (720, 720),      # 518,400
         (768, 768),      # 589,824
+        (720, 1024),
+        (768, 1024),
         (1024, 720),     # 737,280
         (1024, 768),     # 786,432
         (1024, 1024),    # 1,048,576
@@ -315,10 +339,15 @@ def find_best_wan_resolution(mask_width, mask_height):
         (1440, 768),     # 1,105,920
         (1440, 1024),    # 1,474,560
         (1440, 1440),    # 2,073,600
+        (1536, 768),
+        (1536, 1024),
+        (2048, 1024)
     ]
     
     for res_w, res_h in resolutions:
-        if mask_width <= res_w and mask_height <= res_h:
+        # Check if mask dimensions after aspect ratio adjustment will fit in this resolution
+        adjusted_w, adjusted_h = calculate_adjusted_context_dimensions(mask_width, mask_height, res_w, res_h)
+        if adjusted_w <= res_w and adjusted_h <= res_h:
             return (res_w, res_h)
     
     return None
@@ -769,6 +798,10 @@ class InpaintCropImproved:
 
 
     def inpaint_crop_single_image(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask, optional_context_mask):
+        # Store original image dimensions for wan_target fallback
+        orig_image_width = image.shape[2]
+        orig_image_height = image.shape[1]
+        
         if preresize:
             image, mask, optional_context_mask = preresize_imm(image, mask, optional_context_mask, downscale_algorithm, upscale_algorithm, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height)
         if self.DEBUG_MODE:
@@ -839,13 +872,15 @@ class InpaintCropImproved:
         if output_resize_to_target_size == "no":
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, w, h, output_padding, downscale_algorithm, upscale_algorithm)
         elif output_resize_to_target_size == "wan_target":
-            # Find the minimal predefined resolution that fits the context area (w, h)
-            # The context area already includes extend_factor growth from growcontextarea_m
+            # Find the minimal predefined resolution that fits the context area with extend_factor applied
             best_resolution = find_best_wan_resolution(w, h)
             if best_resolution is None:
-                # Mask doesn't fit any predefined resolution, use original size
-                target_w, target_h = w, h
+                # Extended mask doesn't fit any predefined resolution
+                # Fall back to using full original image resolution without extend_factor
+                x, y, w, h = 0, 0, orig_image_width, orig_image_height
+                target_w, target_h = orig_image_width, orig_image_height
             else:
+                # Use the predefined resolution
                 target_w, target_h = best_resolution
             # Pass padding=0 because predefined resolutions should be used as-is, without additional padding
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, target_w, target_h, 0, downscale_algorithm, upscale_algorithm)
