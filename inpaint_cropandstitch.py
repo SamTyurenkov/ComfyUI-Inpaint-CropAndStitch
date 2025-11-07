@@ -880,8 +880,36 @@ class InpaintCropImproved:
                 x, y, w, h = 0, 0, orig_image_width, orig_image_height
                 target_w, target_h = orig_image_width, orig_image_height
             else:
-                # Use the predefined resolution
+                # Use the predefined resolution to determine crop size and aspect ratio
                 target_w, target_h = best_resolution
+                # Clamp target dimensions to not exceed current image dimensions
+                current_image_width = image.shape[2]
+                current_image_height = image.shape[1]
+                target_w = min(target_w, current_image_width)
+                target_h = min(target_h, current_image_height)
+                
+                # Expand the mask area to fill the target dimensions while keeping it centered
+                # Calculate center of current mask area
+                center_x = x + w // 2
+                center_y = y + h // 2
+                
+                # Calculate new position to center the target area on the mask
+                new_x = center_x - target_w // 2
+                new_y = center_y - target_h // 2
+                
+                # Clamp to image bounds
+                if new_x < 0:
+                    new_x = 0
+                elif new_x + target_w > current_image_width:
+                    new_x = current_image_width - target_w
+                    
+                if new_y < 0:
+                    new_y = 0
+                elif new_y + target_h > current_image_height:
+                    new_y = current_image_height - target_h
+                
+                # Update the context area to the full target size
+                x, y, w, h = new_x, new_y, target_w, target_h
             # Pass padding=0 because predefined resolutions should be used as-is, without additional padding
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, target_w, target_h, 0, downscale_algorithm, upscale_algorithm)
         else: # output_resize_to_target_size == "yes"
