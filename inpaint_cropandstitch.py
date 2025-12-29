@@ -577,7 +577,7 @@ class InpaintCropImproved:
                 "context_from_mask_extend_factor": ("FLOAT", {"default": 1.2, "min": 1.0, "max": 100.0, "step": 0.01, "tooltip": "Grow the context area from the mask by a certain factor in every direction. For example, 1.5 grabs extra 50% up, down, left, and right as context."}),
 
                 # Output
-                "output_resize_to_target_size": (["no", "yes", "wan_target"], {"default": "yes", "tooltip": "Force a specific resolution for sampling. 'wan_target' picks best predefined resolution"}),
+                "output_resize_to_target_size": (["no", "yes", "wan_target", "fit_target"], {"default": "yes", "tooltip": "Force a specific resolution for sampling. 'wan_target' picks best predefined resolution. 'fit_target' uses user-provided resolution and errors if mask is too large"}),
                 "output_target_width": ("INT", {"default": 512, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 1}),
                 "output_target_height": ("INT", {"default": 512, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 1}),
                 "output_padding": (["0", "8", "16", "32", "64", "128", "256", "512"], {"default": "32"}),
@@ -975,6 +975,12 @@ class InpaintCropImproved:
         elif output_resize_to_target_size == "wan_target":
             # Pass padding=0 because predefined resolutions should be used as-is, without additional padding
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, target_w, target_h, 0, downscale_algorithm, upscale_algorithm)
+        elif output_resize_to_target_size == "fit_target":
+            # Check if the context area fits within the user-provided resolution
+            if w > output_target_width or h > output_target_height:
+                raise ValueError(f"Mask context area ({w}x{h}) is larger than provided target resolution ({output_target_width}x{output_target_height}). Cannot fit mask into target resolution.")
+            # Use the user-provided resolution
+            canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, output_target_width, output_target_height, output_padding, downscale_algorithm, upscale_algorithm)
         else: # output_resize_to_target_size == "yes"
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, output_target_width, output_target_height, output_padding, downscale_algorithm, upscale_algorithm)
         if self.DEBUG_MODE:
