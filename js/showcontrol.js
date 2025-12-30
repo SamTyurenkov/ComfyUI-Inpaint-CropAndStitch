@@ -38,10 +38,14 @@ function inpaintCropAndStitchHandler(node) {
         }
         toggleWidget(node, findWidgetByName(node, "output_target_width"));
         toggleWidget(node, findWidgetByName(node, "output_target_height"));
+        toggleWidget(node, findWidgetByName(node, "output_padding"));
         if (findWidgetByName(node, "output_resize_to_target_size").value == "yes" || 
             findWidgetByName(node, "output_resize_to_target_size").value == "fit_target") {
             toggleWidget(node, findWidgetByName(node, "output_target_width"), true);
             toggleWidget(node, findWidgetByName(node, "output_target_height"), true);
+        }
+        if (findWidgetByName(node, "output_resize_to_target_size").value == "yes") {
+            toggleWidget(node, findWidgetByName(node, "output_padding"), true);
         }
     }
 

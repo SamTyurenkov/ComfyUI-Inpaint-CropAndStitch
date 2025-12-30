@@ -230,6 +230,28 @@ def findcontextarea_m(mask):
     return context, x, y, w, h
 
 
+def findmaskdimensions_m(mask, threshold=0.5):
+    """
+    Find the actual mask pixel dimensions using a threshold to exclude expanded/blurred edges.
+    Returns (mask_w, mask_h) or (-1, -1) if no mask pixels found.
+    """
+    mask_squeezed = mask[0]  # Now shape is [H, W]
+    # Use threshold to find only core mask pixels, not expanded/blurred edges
+    mask_binary = (mask_squeezed >= threshold)
+    non_zero_indices = torch.nonzero(mask_binary)
+
+    if non_zero_indices.numel() == 0:
+        return -1, -1
+    else:
+        y = torch.min(non_zero_indices[:, 0]).item()
+        x = torch.min(non_zero_indices[:, 1]).item()
+        y_max = torch.max(non_zero_indices[:, 0]).item()
+        x_max = torch.max(non_zero_indices[:, 1]).item()
+        mask_w = x_max - x + 1  # +1 to include the max index
+        mask_h = y_max - y + 1  # +1 to include the max index
+        return mask_w, mask_h
+
+
 def growcontextarea_m(context, mask, x, y, w, h, extend_factor):
     img_h, img_w = mask.shape[1], mask.shape[2]
 
@@ -826,6 +848,14 @@ class InpaintCropImproved:
             context = shared_params['context']
             x, y, w, h = shared_params['x'], shared_params['y'], shared_params['w'], shared_params['h']
             target_w, target_h = shared_params.get('target_w'), shared_params.get('target_h')
+            # Get mask dimensions from shared_params or calculate from processed mask
+            mask_w = shared_params.get('mask_w')
+            mask_h = shared_params.get('mask_h')
+            if mask_w is None or mask_h is None:
+                # Calculate from processed mask if not in shared_params
+                mask_w, mask_h = findmaskdimensions_m(processed_mask, threshold=0.5)
+                if mask_w == -1 or mask_h == -1:
+                    mask_w, mask_h = w, h
             
             # Still need to process the image (not mask-dependent)
             if preresize:
@@ -896,9 +926,16 @@ class InpaintCropImproved:
                 DEBUG_extend_mask = mask.clone()
 
             context, x, y, w, h = findcontextarea_m(mask)
+            # Calculate actual mask pixel dimensions using threshold to exclude expanded/blurred edges
+            mask_w, mask_h = findmaskdimensions_m(mask, threshold=0.5)
+            # If mask dimensions are invalid, fall back to context dimensions
+            if mask_w == -1 or mask_h == -1:
+                mask_w, mask_h = w, h
             # If no mask, mask everything for some inpainting.
             if x == -1 or w == -1 or h == -1 or y == -1:
                 x, y, w, h = 0, 0, image.shape[2], image.shape[1]
+                if mask_w == -1 or mask_h == -1:
+                    mask_w, mask_h = w, h
                 context = mask[:, y:y+h, x:x+w]
             if self.DEBUG_MODE:
                 DEBUG_context_from_mask = context.clone()
@@ -976,11 +1013,11 @@ class InpaintCropImproved:
             # Pass padding=0 because predefined resolutions should be used as-is, without additional padding
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, target_w, target_h, 0, downscale_algorithm, upscale_algorithm)
         elif output_resize_to_target_size == "fit_target":
-            # Check if the context area fits within the user-provided resolution
-            if w > output_target_width or h > output_target_height:
-                raise ValueError(f"Mask context area ({w}x{h}) is larger than provided target resolution ({output_target_width}x{output_target_height}). Cannot fit mask into target resolution.")
-            # Use the user-provided resolution
-            canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, output_target_width, output_target_height, output_padding, downscale_algorithm, upscale_algorithm)
+            # Check if the mask pixel dimensions fit within the user-provided resolution
+            if mask_w > output_target_width or mask_h > output_target_height:
+                raise ValueError(f"Mask pixel dimensions ({mask_w}x{mask_h}) are larger than provided target resolution ({output_target_width}x{output_target_height}). Cannot fit mask into target resolution.")
+            # Use the user-provided resolution with padding=0 (padding is disabled for fit_target)
+            canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, output_target_width, output_target_height, 0, downscale_algorithm, upscale_algorithm)
         else: # output_resize_to_target_size == "yes"
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, output_target_width, output_target_height, output_padding, downscale_algorithm, upscale_algorithm)
         if self.DEBUG_MODE:
@@ -1027,6 +1064,8 @@ class InpaintCropImproved:
                 'y': y,
                 'w': w,
                 'h': h,
+                'mask_w': mask_w,
+                'mask_h': mask_h,
                 'target_w': final_target_w,
                 'target_h': final_target_h,
             }
