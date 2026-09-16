@@ -622,8 +622,8 @@ class InpaintCropImproved:
     # Remove the following # to turn on debug mode (extra outputs, print statements)
     #'''
     DEBUG_MODE = False
-    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK")
-    RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask")
+    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK", "H3FACEXFORM")
+    RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask", "transform")
 
     '''
     
@@ -852,6 +852,38 @@ class InpaintCropImproved:
         result_image = torch.stack(result_image, dim=0)
         result_mask = torch.stack(result_mask, dim=0)
 
+        batch_size = result_image.shape[0]
+        canvas_h, canvas_w = int(result_image.shape[1]), int(result_image.shape[2])
+        boxes = []
+        for i in range(batch_size):
+            ctc_x = result_stitcher['cropped_to_canvas_x'][i]
+            ctc_y = result_stitcher['cropped_to_canvas_y'][i]
+            ctc_w = result_stitcher['cropped_to_canvas_w'][i]
+            ctc_h = result_stitcher['cropped_to_canvas_h'][i]
+            cto_x = result_stitcher['canvas_to_orig_x'][i]
+            cto_y = result_stitcher['canvas_to_orig_y'][i]
+            boxes.append((
+                float(ctc_x - cto_x),
+                float(ctc_y - cto_y),
+                float(ctc_w),
+                float(ctc_h),
+            ))
+        src_w = int(result_stitcher['canvas_to_orig_w'][0]) if batch_size else canvas_w
+        src_h = int(result_stitcher['canvas_to_orig_h'][0]) if batch_size else canvas_h
+        transform = {
+            "boxes": boxes,
+            "canvas": (canvas_w, canvas_h),
+            "src_size": (src_w, src_h),
+            "frames": int(batch_size),
+            "source": list(range(batch_size)),
+            "source_frames": int(batch_size),
+            "segments": [(0, int(batch_size))],
+            "absent": [False] * batch_size,
+            "weights": [1.0] * batch_size,
+            "detected": [True] * batch_size,
+            "crop_factor": float(context_from_mask_extend_factor),
+        }
+
         if self.DEBUG_MODE:
             print('Inpaint Crop Batch output')
             print(result_image.shape, type(result_image), result_image.dtype)
@@ -859,7 +891,7 @@ class InpaintCropImproved:
 
         debug_outputs = {name: torch.stack(values, dim=0) for name, values in debug_outputs.items()}
 
-        return result_stitcher, result_image, result_mask, *[debug_outputs[name] for name in self.RETURN_NAMES if name.startswith("DEBUG_")]
+        return result_stitcher, result_image, result_mask, transform, *[debug_outputs[name] for name in self.RETURN_NAMES if name.startswith("DEBUG_")]
 
 
     def inpaint_crop_single_image(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask, optional_context_mask, shared_params=None):
