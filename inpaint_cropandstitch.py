@@ -603,6 +603,9 @@ class InpaintCropImproved:
                 "output_target_width": ("INT", {"default": 512, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 1}),
                 "output_target_height": ("INT", {"default": 512, "min": 64, "max": nodes.MAX_RESOLUTION, "step": 1}),
                 "output_padding": (["0", "8", "16", "32", "64", "128", "256", "512"], {"default": "32"}),
+
+                # Batch pairing
+                "batch_mask_mode": (["default", "1mask1image"], {"default": "default", "tooltip": "default: crop all frames with the first mask's region. 1mask1image: crop each frame with the mask at the same index. Masks may differ in size/position (e.g. a tracked face). Mask count must equal frame count, and output_resize_to_target_size cannot be 'no'. Stitch uses those same per-frame masks."}),
            },
            "optional": {
                 # Optional inputs
@@ -680,7 +683,7 @@ class InpaintCropImproved:
     #'''
 
  
-    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask=None, optional_context_mask=None):
+    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, batch_mask_mode="default", mask=None, optional_context_mask=None):
         image = image.clone()
         if mask is not None:
             mask = mask.clone()
@@ -720,16 +723,24 @@ class InpaintCropImproved:
         # If no mask is provided, create one with the shape of the image
         if mask is None:
             mask = torch.zeros_like(image[:, :, :, 0])
-    
-        # If there is only one image for many masks, replicate it for all masks
-        if mask.shape[0] > 1 and image.shape[0] == 1:
-            assert image.dim() == 4, f"Expected 4D BHWC image tensor, got {image.shape}"
-            image = image.expand(mask.shape[0], -1, -1, -1).clone()
 
-        # If there is only one mask for many images, replicate it for all images
-        if image.shape[0] > 1 and mask.shape[0] == 1:
-            assert mask.dim() == 3, f"Expected 3D BHW mask tensor, got {mask.shape}"
-            mask = mask.expand(image.shape[0], -1, -1).clone()
+        if batch_mask_mode == "1mask1image":
+            assert output_resize_to_target_size != "no", (
+                "1mask1image requires output_resize_to_target_size other than 'no' so all crops share one resolution"
+            )
+            assert mask.shape[0] == image.shape[0], (
+                f"1mask1image requires one mask per image. Expected {image.shape[0]} masks, got {mask.shape[0]}"
+            )
+        else:
+            # If there is only one image for many masks, replicate it for all masks
+            if mask.shape[0] > 1 and image.shape[0] == 1:
+                assert image.dim() == 4, f"Expected 4D BHWC image tensor, got {image.shape}"
+                image = image.expand(mask.shape[0], -1, -1, -1).clone()
+
+            # If there is only one mask for many images, replicate it for all images
+            if image.shape[0] > 1 and mask.shape[0] == 1:
+                assert mask.dim() == 3, f"Expected 3D BHW mask tensor, got {mask.shape}"
+                mask = mask.expand(image.shape[0], -1, -1).clone()
 
         # If no optional_context_mask is provided, create one with the shape of the image
         if optional_context_mask is None:
@@ -779,9 +790,10 @@ class InpaintCropImproved:
 
         batch_size = image.shape[0]
         
-        # Optimization: Process mask operations once for the first image, reuse for rest of batch
-        # Since masks are replicated to match batch size, they're identical for all images
+        # default: process mask once for the first frame and reuse crop region for the rest.
+        # 1mask1image: crop each frame with the mask at the same index.
         shared_params = None
+        reuse_first_mask = batch_mask_mode == "default"
         
         for b in range(batch_size):
             one_image = image[b].unsqueeze(0)
@@ -799,7 +811,7 @@ class InpaintCropImproved:
             stitcher, cropped_image, cropped_mask = outputs[:3]
             
             # Extract shared_params from first image to reuse for subsequent images
-            if b == 0 and batch_size > 1:
+            if reuse_first_mask and b == 0 and batch_size > 1:
                 # Check if last element is shared_params dict
                 if len(outputs) > 3 and isinstance(outputs[-1], dict) and 'processed_mask' in outputs[-1]:
                     shared_params = outputs[-1]
@@ -821,6 +833,21 @@ class InpaintCropImproved:
                 if name.startswith("DEBUG_"):
                     output_array = output.squeeze(0)  # Assuming output needs to be squeezed similar to image/mask
                     debug_outputs[name].append(output_array)
+
+        # wan_target may pick a different preset per mask size; keep one output size for the batch.
+        if batch_mask_mode == "1mask1image" and output_resize_to_target_size == "wan_target" and result_image:
+            sizes = [(im.shape[0], im.shape[1]) for im in result_image]
+            if len(set(sizes)) > 1:
+                target_h, target_w = max(sizes, key=lambda s: s[0] * s[1])
+                for i, im in enumerate(result_image):
+                    if im.shape[0] == target_h and im.shape[1] == target_w:
+                        continue
+                    algorithm = upscale_algorithm if target_h > im.shape[0] or target_w > im.shape[1] else downscale_algorithm
+                    result_image[i] = rescale_i(im.unsqueeze(0), target_w, target_h, algorithm).squeeze(0)
+                    result_mask[i] = rescale_m(result_mask[i].unsqueeze(0), target_w, target_h, algorithm).squeeze(0)
+                    result_stitcher['cropped_mask_for_blend'][i] = rescale_m(
+                        result_stitcher['cropped_mask_for_blend'][i], target_w, target_h, algorithm
+                    )
 
         result_image = torch.stack(result_image, dim=0)
         result_mask = torch.stack(result_mask, dim=0)
