@@ -561,6 +561,56 @@ def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ct
     return output_image
 
 
+def smooth_crop_params(frame_params, window):
+    """
+    Stabilize per-frame crop boxes for video. Each entry is the shared_params dict that
+    inpaint_crop_single_image returns for one frame. Box centers are averaged over a centered
+    window of `window` frames, and every box gets the largest width and height in the batch,
+    so the crop neither jitters nor zooms. Frames whose processed mask is empty are left out
+    of the size and take a center interpolated from their neighbours.
+    Returns new params dicts with x, y, w, h (and context) replaced.
+    """
+    n = len(frame_params)
+    img_h, img_w = frame_params[0]['processed_mask'].shape[1:3]
+    valid = np.array([float(p['processed_mask'].max()) > 0 for p in frame_params])
+    if not valid.any():
+        return frame_params
+
+    xs = np.array([p['x'] for p in frame_params], dtype=np.float64)
+    ys = np.array([p['y'] for p in frame_params], dtype=np.float64)
+    ws = np.array([p['w'] for p in frame_params], dtype=np.float64)
+    hs = np.array([p['h'] for p in frame_params], dtype=np.float64)
+    cx = xs + ws / 2.0
+    cy = ys + hs / 2.0
+
+    idx = np.arange(n)
+    cx = np.interp(idx, idx[valid], cx[valid])
+    cy = np.interp(idx, idx[valid], cy[valid])
+
+    radius = window // 2
+    if radius > 0:
+        kernel = np.ones(2 * radius + 1) / (2 * radius + 1)
+        cx = np.convolve(np.pad(cx, radius, mode='edge'), kernel, mode='valid')
+        cy = np.convolve(np.pad(cy, radius, mode='edge'), kernel, mode='valid')
+
+    box_w = int(min(ws[valid].max(), img_w))
+    box_h = int(min(hs[valid].max(), img_h))
+
+    result = []
+    for b, p in enumerate(frame_params):
+        x = int(round(cx[b] - box_w / 2.0))
+        y = int(round(cy[b] - box_h / 2.0))
+        x = max(0, min(x, img_w - box_w))
+        y = max(0, min(y, img_h - box_h))
+        q = dict(p)
+        q.update({
+            'x': x, 'y': y, 'w': box_w, 'h': box_h,
+            'context': p['processed_mask'][:, y:y+box_h, x:x+box_w],
+        })
+        result.append(q)
+    return result
+
+
 class InpaintCropImproved:
     @classmethod
     def INPUT_TYPES(cls):
@@ -606,6 +656,7 @@ class InpaintCropImproved:
 
                 # Batch pairing
                 "batch_mask_mode": (["default", "1mask1image"], {"default": "default", "tooltip": "default: crop all frames with the first mask's region. 1mask1image: crop each frame with the mask at the same index. Masks may differ in size/position (e.g. a tracked face). Mask count must equal frame count, and output_resize_to_target_size cannot be 'no'. Stitch uses those same per-frame masks."}),
+                "crop_smooth_frames": ("INT", {"default": 0, "min": 0, "max": 255, "step": 1, "tooltip": "1mask1image only. 0 = off. Stabilizes the per-frame crop box for video: the box center is averaged over a centered window of this many frames, and the box size is locked to the largest box in the batch, so the crop does not jitter or zoom with the mask. Frames with an empty mask take the center interpolated from their neighbours. Masks themselves stay per-frame."}),
            },
            "optional": {
                 # Optional inputs
@@ -683,7 +734,7 @@ class InpaintCropImproved:
     #'''
 
  
-    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, batch_mask_mode="default", mask=None, optional_context_mask=None):
+    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, batch_mask_mode="default", crop_smooth_frames=0, mask=None, optional_context_mask=None):
         image = image.clone()
         if mask is not None:
             mask = mask.clone()
@@ -794,19 +845,26 @@ class InpaintCropImproved:
         # 1mask1image: crop each frame with the mask at the same index.
         shared_params = None
         reuse_first_mask = batch_mask_mode == "default"
-        
-        for b in range(batch_size):
-            one_image = image[b].unsqueeze(0)
-            one_mask = mask[b].unsqueeze(0)
-            one_optional_context_mask = optional_context_mask[b].unsqueeze(0)
 
-            outputs = self.inpaint_crop_single_image(
-                one_image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode,
+        def crop_one(b, params):
+            return self.inpaint_crop_single_image(
+                image[b].unsqueeze(0), downscale_algorithm, upscale_algorithm, preresize, preresize_mode,
                 preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height,
                 extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor,
                 mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels,
                 context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height,
-                output_padding, one_mask, one_optional_context_mask, shared_params)
+                output_padding, mask[b].unsqueeze(0), optional_context_mask[b].unsqueeze(0), params)
+
+        # 1mask1image + crop_smooth_frames: first pass finds every frame's own crop box,
+        # then the boxes are smoothed and the second pass crops each frame with its smoothed box.
+        smoothed_params = None
+        if batch_mask_mode == "1mask1image" and crop_smooth_frames > 0 and batch_size > 1:
+            frame_params = [crop_one(b, None)[-1] for b in range(batch_size)]
+            smoothed_params = smooth_crop_params(frame_params, crop_smooth_frames)
+
+        for b in range(batch_size):
+            params = smoothed_params[b] if smoothed_params is not None else shared_params
+            outputs = crop_one(b, params)
 
             stitcher, cropped_image, cropped_mask = outputs[:3]
             
