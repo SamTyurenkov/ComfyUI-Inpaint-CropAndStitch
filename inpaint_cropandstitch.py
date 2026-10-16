@@ -702,7 +702,7 @@ class InpaintCropImproved:
                 "output_padding": (["0", "8", "16", "32", "64", "128", "256", "512"], {"default": "32"}),
 
                 # Batch pairing
-                "batch_mask_mode": (["default", "1mask1image"], {"default": "default", "tooltip": "default: crop all frames with the first mask's region. 1mask1image: crop each frame with the mask at the same index. Masks may differ in size/position (e.g. a tracked face). Mask count must equal frame count, and output_resize_to_target_size cannot be 'no'. Stitch uses those same per-frame masks."}),
+                "batch_mask_mode": (["default", "1mask1image", "union"], {"default": "default", "tooltip": "default: crop all frames with the first mask's region. 1mask1image: crop each frame with the mask at the same index. Masks may differ in size/position (e.g. a tracked face). Mask count must equal frame count, and output_resize_to_target_size cannot be 'no'. Stitch uses those same per-frame masks. union: merge all masks into one mask that covers every frame, and crop and stitch every frame with it (one fixed box, no crop motion)."}),
                 "crop_smooth_frames": ("INT", {"default": 0, "min": 0, "max": 255, "step": 1, "tooltip": "1mask1image only. 0 = off. Stabilizes the per-frame crop box for video: the box center is averaged over a centered window of this many frames, and the box size is locked to the largest box in the batch, so the crop does not jitter or zoom with the mask. Frames with an empty mask take the center interpolated from their neighbours. Masks themselves stay per-frame."}),
            },
            "optional": {
@@ -830,6 +830,11 @@ class InpaintCropImproved:
                 f"1mask1image requires one mask per image. Expected {image.shape[0]} masks, got {mask.shape[0]}"
             )
         else:
+            # union: merge all masks into one that covers every frame's mask, then crop all
+            # frames with that one mask like default does (one fixed box, one blend mask).
+            if batch_mask_mode == "union" and mask.shape[0] > 1:
+                mask = mask.amax(dim=0, keepdim=True)
+
             # If there is only one image for many masks, replicate it for all masks
             if mask.shape[0] > 1 and image.shape[0] == 1:
                 assert image.dim() == 4, f"Expected 4D BHWC image tensor, got {image.shape}"
@@ -893,7 +898,7 @@ class InpaintCropImproved:
         # default: process mask once for the first frame and reuse crop region for the rest.
         # 1mask1image: crop each frame with the mask at the same index.
         shared_params = None
-        reuse_first_mask = batch_mask_mode == "default"
+        reuse_first_mask = batch_mask_mode in ("default", "union")
 
         def crop_one(b, params):
             return self.inpaint_crop_single_image(
