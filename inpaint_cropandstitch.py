@@ -529,7 +529,39 @@ def crop_magic_im(image, mask, x, y, w, h, target_w, target_h, padding, downscal
     return canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h
 
 
-def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm):
+def subpixel_crop(canvas, x, y, w, h, sub_x, sub_y):
+    """
+    Crop [B, H, W, C] canvas at the fractional position (x + sub_x, y + sub_y), size w x h,
+    with bilinear sampling. sub_x and sub_y are in [0, 1). The canvas edge is repeated if the
+    extra sampled row or column falls outside it.
+    """
+    region = canvas[:, y:y + h + 1, x:x + w + 1]
+    pad_h, pad_w = h + 1 - region.shape[1], w + 1 - region.shape[2]
+    if pad_h > 0:
+        region = torch.cat([region, region[:, -1:].repeat(1, pad_h, 1, 1)], dim=1)
+    if pad_w > 0:
+        region = torch.cat([region, region[:, :, -1:].repeat(1, 1, pad_w, 1)], dim=2)
+    region = (1.0 - sub_y) * region[:, :h] + sub_y * region[:, 1:h + 1]
+    return (1.0 - sub_x) * region[:, :, :w] + sub_x * region[:, :, 1:w + 1]
+
+
+def subpixel_place(samples, sub_x, sub_y, pad_mode):
+    """
+    Inverse of subpixel_crop: turn a [B, h, w, C] crop sampled at a fractional offset back into
+    canvas pixels. Returns [B, h + 1, w + 1, C] covering the integer pixels from (x, y).
+    pad_mode 'edge' repeats the border (image), 'zero' fades it out (blend mask).
+    """
+    if pad_mode == 'edge':
+        padded = torch.cat([samples[:, :1], samples, samples[:, -1:]], dim=1)
+        padded = torch.cat([padded[:, :, :1], padded, padded[:, :, -1:]], dim=2)
+    else:
+        padded = torch.nn.functional.pad(samples.movedim(-1, 1), (1, 1, 1, 1)).movedim(1, -1)
+    h, w = samples.shape[1], samples.shape[2]
+    padded = sub_y * padded[:, :h + 1] + (1.0 - sub_y) * padded[:, 1:h + 2]
+    return sub_x * padded[:, :, :w + 1] + (1.0 - sub_x) * padded[:, :, 1:w + 2]
+
+
+def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm, sub_x=0.0, sub_y=0.0):
     canvas_image = canvas_image.clone()
     inpainted_image = inpainted_image.clone()
     mask = mask.clone()
@@ -545,6 +577,15 @@ def stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ct
 
     # Clamp mask to [0, 1] and expand to match image channels
     resized_mask = resized_mask.clamp(0, 1).unsqueeze(-1)  # shape: [1, H, W, 1]
+
+    # The crop was sampled at a fractional offset: put it back at that offset (one pixel larger)
+    if sub_x or sub_y:
+        resized_image = subpixel_place(resized_image, sub_x, sub_y, 'edge')
+        resized_mask = subpixel_place(resized_mask, sub_x, sub_y, 'zero')
+        ctc_h = min(ctc_h + 1, canvas_image.shape[1] - ctc_y)
+        ctc_w = min(ctc_w + 1, canvas_image.shape[2] - ctc_x)
+        resized_image = resized_image[:, :ctc_h, :ctc_w]
+        resized_mask = resized_mask[:, :ctc_h, :ctc_w]
 
     # Extract the canvas region we're about to overwrite
     canvas_crop = canvas_image[:, ctc_y:ctc_y + ctc_h, ctc_x:ctc_x + ctc_w]
@@ -598,13 +639,19 @@ def smooth_crop_params(frame_params, window):
 
     result = []
     for b, p in enumerate(frame_params):
-        x = int(round(cx[b] - box_w / 2.0))
-        y = int(round(cy[b] - box_h / 2.0))
-        x = max(0, min(x, img_w - box_w))
-        y = max(0, min(y, img_h - box_h))
+        # Keep the fractional part of the box position: video models snap the face to the crop
+        # window, so a box moving in whole-pixel steps makes the stitched face jump by 1px.
+        # The crop samples at the fractional offset and the stitch puts it back at the same offset.
+        # One pixel of margin is kept so the shifted sample stays inside the image.
+        fx = cx[b] - box_w / 2.0
+        fy = cy[b] - box_h / 2.0
+        fx = 0.0 if box_w >= img_w else max(0.0, min(fx, img_w - box_w - 1.0))
+        fy = 0.0 if box_h >= img_h else max(0.0, min(fy, img_h - box_h - 1.0))
+        x, y = int(math.floor(fx)), int(math.floor(fy))
         q = dict(p)
         q.update({
             'x': x, 'y': y, 'w': box_w, 'h': box_h,
+            'subpixel_x': float(fx - x), 'subpixel_y': float(fy - y),
             'context': p['processed_mask'][:, y:y+box_h, x:x+box_w],
         })
         result.append(q)
@@ -832,6 +879,8 @@ class InpaintCropImproved:
             'cropped_to_canvas_w': [],
             'cropped_to_canvas_h': [],
             'cropped_mask_for_blend': [],
+            'subpixel_x': [],
+            'subpixel_y': [],
         }
         
         result_image = []
@@ -874,7 +923,7 @@ class InpaintCropImproved:
                 if len(outputs) > 3 and isinstance(outputs[-1], dict) and 'processed_mask' in outputs[-1]:
                     shared_params = outputs[-1]
             
-            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
+            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend', 'subpixel_x', 'subpixel_y']:
                 result_stitcher[key].append(stitcher[key])
 
             cropped_image = cropped_image.clone().squeeze(0)
@@ -1181,6 +1230,19 @@ class InpaintCropImproved:
             DEBUG_orig_in_canvas_location = debug_context_location_in_image(canvas_image, cto_x, cto_y, cto_w, cto_h)
             DEBUG_cropped_in_canvas_location = debug_context_location_in_image(canvas_image, ctc_x, ctc_y, ctc_w, ctc_h)
 
+        # Smoothed video boxes carry a fractional position: re-sample the crop at that offset.
+        sub_x = shared_params.get('subpixel_x', 0.0) if shared_params is not None else 0.0
+        sub_y = shared_params.get('subpixel_y', 0.0) if shared_params is not None else 0.0
+        if sub_x or sub_y:
+            canvas_mask = torch.ones(canvas_image.shape[:3], device=mask.device, dtype=mask.dtype)
+            canvas_mask[:, cto_y:cto_y + cto_h, cto_x:cto_x + cto_w] = mask
+            target_h, target_w = cropped_image.shape[1], cropped_image.shape[2]
+            algorithm = upscale_algorithm if target_w > ctc_w or target_h > ctc_h else downscale_algorithm
+            shifted = subpixel_crop(canvas_image, ctc_x, ctc_y, ctc_w, ctc_h, sub_x, sub_y)
+            cropped_image = shifted if shifted.shape[1:3] == (target_h, target_w) else rescale_i(shifted, target_w, target_h, algorithm)
+            shifted = subpixel_crop(canvas_mask.unsqueeze(-1), ctc_x, ctc_y, ctc_w, ctc_h, sub_x, sub_y)[..., 0]
+            cropped_mask = shifted if shifted.shape[1:3] == (target_h, target_w) else rescale_m(shifted, target_w, target_h, algorithm)
+
         # For blending, grow the mask even further and make it blurrier.
         cropped_mask_blend = cropped_mask.clone()
         if mask_blend_pixels > 0:
@@ -1199,6 +1261,8 @@ class InpaintCropImproved:
             'cropped_to_canvas_w': ctc_w,
             'cropped_to_canvas_h': ctc_h,
             'cropped_mask_for_blend': cropped_mask_blend,
+            'subpixel_x': sub_x,
+            'subpixel_y': sub_y,
         }
 
         # Return shared_params for first image to reuse in subsequent images
@@ -1275,7 +1339,9 @@ class InpaintStitchImproved:
             one_stitcher = {}
             for key in ['downscale_algorithm', 'upscale_algorithm', 'blend_pixels']:
                 one_stitcher[key] = stitcher[key]
-            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
+            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend', 'subpixel_x', 'subpixel_y']:
+                if key not in stitcher: # stitchers made before subpixel support
+                    continue
                 if override: # One stitcher for many images, always read 0.
                     one_stitcher[key] = stitcher[key][0]
                 else:
@@ -1307,6 +1373,9 @@ class InpaintStitchImproved:
 
         mask = stitcher['cropped_mask_for_blend']  # shape: [1, H, W]
 
-        output_image = stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm)
+        sub_x = stitcher.get('subpixel_x', 0.0)
+        sub_y = stitcher.get('subpixel_y', 0.0)
+
+        output_image = stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm, sub_x, sub_y)
 
         return (output_image,)
