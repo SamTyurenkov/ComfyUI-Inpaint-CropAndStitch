@@ -702,7 +702,7 @@ class InpaintCropImproved:
                 "output_padding": (["0", "8", "16", "32", "64", "128", "256", "512"], {"default": "32"}),
 
                 # Batch pairing
-                "batch_mask_mode": (["default", "1mask1image", "union"], {"default": "default", "tooltip": "default: crop all frames with the first mask's region. 1mask1image: crop each frame with the mask at the same index. Masks may differ in size/position (e.g. a tracked face). Mask count must equal frame count, and output_resize_to_target_size cannot be 'no'. Stitch uses those same per-frame masks. union: merge all masks into one mask that covers every frame, and crop and stitch every frame with it (one fixed box, no crop motion)."}),
+                "batch_mask_mode": (["default", "1mask1image", "union"], {"default": "default", "tooltip": "default: crop all frames with the first mask's region. 1mask1image: crop each frame with the mask at the same index. Masks may differ in size/position (e.g. a tracked face). Mask count must equal frame count, and output_resize_to_target_size cannot be 'no'. Stitch uses those same per-frame masks. union: merge all masks into one mask that covers every frame, and crop and stitch every frame with it (one fixed box, no crop motion); cropped_mask is that single mask."}),
                 "crop_smooth_frames": ("INT", {"default": 0, "min": 0, "max": 255, "step": 1, "tooltip": "1mask1image only. 0 = off. Stabilizes the per-frame crop box for video: the box center is averaged over a centered window of this many frames, and the box size is locked to the largest box in the batch, so the crop does not jitter or zoom with the mask. Frames with an empty mask take the center interpolated from their neighbours. Masks themselves stay per-frame."}),
            },
            "optional": {
@@ -963,6 +963,9 @@ class InpaintCropImproved:
 
         result_image = torch.stack(result_image, dim=0)
         result_mask = torch.stack(result_mask, dim=0)
+        # union: every frame shares the one merged mask, so output it once
+        if batch_mask_mode == "union":
+            result_mask = result_mask[:1]
 
         batch_size = result_image.shape[0]
         canvas_h, canvas_w = int(result_image.shape[1]), int(result_image.shape[2])
