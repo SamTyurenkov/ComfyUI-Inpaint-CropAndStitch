@@ -1,11 +1,21 @@
 import comfy.utils
 import math
+import os
 import nodes
 import numpy as np
 import torch
 import torchvision.transforms.functional as F
 from PIL import Image
 from scipy.ndimage import gaussian_filter, grey_dilation, binary_closing, binary_fill_holes
+
+from .stitcher_storage import (
+    CanvasReader,
+    CanvasWriter,
+    canvas_path,
+    discard_canvas_file,
+    is_disk_stitcher,
+    vhs_disk_module,
+)
 
 
 def rescale_i(samples, width, height, algorithm: str):
@@ -709,8 +719,22 @@ class InpaintCropImproved:
                 # Optional inputs
                 "mask": ("MASK",),
                 "optional_context_mask": ("MASK",),
-           }
+                # OPTIONAL and last on purpose: saved workflows keep their widgets_values
+                # order, and API prompts without this key still validate (default "ram").
+                "stitcher_storage": (["ram", "disk"], {"default": "ram", "tooltip": "Where the stitcher keeps its full-size copy of every frame until the stitch. ram: in memory (a second full copy of the clip, held through sampling and decode). disk: a raw float32 file under /root/autodl-tmp/inpaint_stitcher (or INPAINT_STITCHER_DIR), lossless, deleted by the stitch node when cleanup_disk is on. While the file is missing this node re-runs on the next queue."}),
+           },
+           "hidden": {
+                "unique_id": "UNIQUE_ID",
+           },
         }
+
+    @classmethod
+    def IS_CHANGED(cls, stitcher_storage="ram", unique_id=None, **kwargs):
+        # A disk stitcher is only valid while its canvas file exists. Once a stitch has
+        # deleted it, the cached stitcher must not be reused, so force a re-run.
+        if stitcher_storage == "disk" and not os.path.isfile(canvas_path(unique_id)):
+            return float("nan")
+        return stitcher_storage
 
     FUNCTION = "inpaint_crop"
     CATEGORY = "inpaint"
@@ -781,12 +805,10 @@ class InpaintCropImproved:
     #'''
 
  
-    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, batch_mask_mode="default", crop_smooth_frames=0, mask=None, optional_context_mask=None):
-        image = image.clone()
-        if mask is not None:
-            mask = mask.clone()
-        if optional_context_mask is not None:
-            optional_context_mask = optional_context_mask.clone()
+    def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, batch_mask_mode="default", crop_smooth_frames=0, stitcher_storage="ram", mask=None, optional_context_mask=None, unique_id=None):
+        # No defensive clones of the inputs: nothing below writes into image, mask or
+        # optional_context_mask in place, and for a video each clone is a full extra copy
+        # of the batch (image ~25 MB/frame at 1080p, masks ~8 MB/frame).
 
         output_padding = int(output_padding)
         
@@ -838,21 +860,22 @@ class InpaintCropImproved:
             # If there is only one image for many masks, replicate it for all masks
             if mask.shape[0] > 1 and image.shape[0] == 1:
                 assert image.dim() == 4, f"Expected 4D BHWC image tensor, got {image.shape}"
-                image = image.expand(mask.shape[0], -1, -1, -1).clone()
+                image = image.expand(mask.shape[0], -1, -1, -1)
 
             # If there is only one mask for many images, replicate it for all images
             if image.shape[0] > 1 and mask.shape[0] == 1:
                 assert mask.dim() == 3, f"Expected 3D BHW mask tensor, got {mask.shape}"
-                mask = mask.expand(image.shape[0], -1, -1).clone()
+                mask = mask.expand(image.shape[0], -1, -1)
 
         # If no optional_context_mask is provided, create one with the shape of the image
+        # (a single frame, broadcast below as a view rather than a zero-filled batch)
         if optional_context_mask is None:
-            optional_context_mask = torch.zeros_like(image[:, :, :, 0])
+            optional_context_mask = torch.zeros_like(image[:1, :, :, 0])
 
         # If there is only one optional_context_mask for many images, replicate it for all images
         if image.shape[0] > 1 and optional_context_mask.shape[0] == 1:
             assert optional_context_mask.dim() == 3, f"Expected 3D BHW optional_context_mask tensor, got {optional_context_mask.shape}"
-            optional_context_mask = optional_context_mask.expand(image.shape[0], -1, -1).clone()
+            optional_context_mask = optional_context_mask.expand(image.shape[0], -1, -1)
 
         if self.DEBUG_MODE:
             print('Inpaint Crop Batch ready')
@@ -916,35 +939,54 @@ class InpaintCropImproved:
             frame_params = [crop_one(b, None)[-1] for b in range(batch_size)]
             smoothed_params = smooth_crop_params(frame_params, crop_smooth_frames)
 
-        for b in range(batch_size):
-            params = smoothed_params[b] if smoothed_params is not None else shared_params
-            outputs = crop_one(b, params)
+        # disk: canvases are streamed to one file as they are made; the stitcher keeps offsets
+        canvas_writer = None
+        if stitcher_storage == "disk":
+            result_stitcher['canvas_storage'] = 'disk'
+            result_stitcher['canvas_file'] = canvas_path(unique_id)
+            canvas_writer = CanvasWriter(result_stitcher['canvas_file'])
 
-            stitcher, cropped_image, cropped_mask = outputs[:3]
-            
-            # Extract shared_params from first image to reuse for subsequent images
-            if reuse_first_mask and b == 0 and batch_size > 1:
-                # Check if last element is shared_params dict
-                if len(outputs) > 3 and isinstance(outputs[-1], dict) and 'processed_mask' in outputs[-1]:
-                    shared_params = outputs[-1]
-            
-            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend', 'subpixel_x', 'subpixel_y']:
-                result_stitcher[key].append(stitcher[key])
+        try:
+            for b in range(batch_size):
+                params = smoothed_params[b] if smoothed_params is not None else shared_params
+                outputs = crop_one(b, params)
 
-            cropped_image = cropped_image.clone().squeeze(0)
-            result_image.append(cropped_image)
-            cropped_mask = cropped_mask.clone().squeeze(0)
-            result_mask.append(cropped_mask)
+                stitcher, cropped_image, cropped_mask = outputs[:3]
 
-            # Handle the DEBUG_ fields dynamically
-            # If this is the first image and has shared_params, exclude the last element
-            has_shared_params_output = (b == 0 and batch_size > 1 and shared_params is not None)
-            debug_outputs_end = len(outputs) - 1 if has_shared_params_output else len(outputs)
-            
-            for name, output in zip(self.RETURN_NAMES[3:], outputs[3:debug_outputs_end]):  # Start from index 3 since first 3 are fixed
-                if name.startswith("DEBUG_"):
-                    output_array = output.squeeze(0)  # Assuming output needs to be squeezed similar to image/mask
-                    debug_outputs[name].append(output_array)
+                # Extract shared_params from first image to reuse for subsequent images
+                if reuse_first_mask and b == 0 and batch_size > 1:
+                    # Check if last element is shared_params dict
+                    if len(outputs) > 3 and isinstance(outputs[-1], dict) and 'processed_mask' in outputs[-1]:
+                        shared_params = outputs[-1]
+
+                for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend', 'subpixel_x', 'subpixel_y']:
+                    value = stitcher[key]
+                    if key == 'canvas_image' and canvas_writer is not None:
+                        value = canvas_writer.write(value)
+                    result_stitcher[key].append(value)
+
+                cropped_image = cropped_image.clone().squeeze(0)
+                result_image.append(cropped_image)
+                cropped_mask = cropped_mask.clone().squeeze(0)
+                result_mask.append(cropped_mask)
+
+                # Handle the DEBUG_ fields dynamically
+                # If this is the first image and has shared_params, exclude the last element
+                has_shared_params_output = (b == 0 and batch_size > 1 and shared_params is not None)
+                debug_outputs_end = len(outputs) - 1 if has_shared_params_output else len(outputs)
+
+                for name, output in zip(self.RETURN_NAMES[3:], outputs[3:debug_outputs_end]):  # Start from index 3 since first 3 are fixed
+                    if name.startswith("DEBUG_"):
+                        output_array = output.squeeze(0)  # Assuming output needs to be squeezed similar to image/mask
+                        debug_outputs[name].append(output_array)
+                del outputs, stitcher
+
+            if canvas_writer is not None:
+                canvas_writer.close()
+        except BaseException:
+            if canvas_writer is not None:
+                canvas_writer.abort()
+            raise
 
         # wan_target may pick a different preset per mask size; keep one output size for the batch.
         if batch_mask_mode == "1mask1image" and output_resize_to_target_size == "wan_target" and result_image:
@@ -1308,6 +1350,38 @@ class InpaintCropImproved:
 
 
 
+STITCHER_PER_FRAME_KEYS = ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend', 'subpixel_x', 'subpixel_y']
+
+
+def stitch_frame_count(stitcher, inpainted_image, max_frames=0):
+    batch_size = inpainted_image.shape[0]
+    n_stitch = len(stitcher['cropped_to_canvas_x'])
+    assert n_stitch == batch_size or n_stitch == 1, f"Stitch batch size doesn't match image batch size (stitcher {n_stitch}, images {batch_size})"
+    return batch_size if max_frames <= 0 else min(max_frames, batch_size)
+
+
+def iter_stitched_frames(stitch_node, stitcher, inpainted_image, max_frames=0):
+    """Yield the stitched frames one by one as [H, W, C] tensors."""
+    total = stitch_frame_count(stitcher, inpainted_image, max_frames)
+    override = len(stitcher['cropped_to_canvas_x']) != inpainted_image.shape[0]  # one stitcher for many images, always read 0
+    reader = CanvasReader(stitcher.get('canvas_file')) if is_disk_stitcher(stitcher) else None
+    try:
+        for b in range(total):
+            i = 0 if override else b
+            one_stitcher = {key: stitcher[key] for key in ['downscale_algorithm', 'upscale_algorithm', 'blend_pixels']}
+            for key in STITCHER_PER_FRAME_KEYS:
+                if key not in stitcher:  # stitchers made before subpixel support
+                    continue
+                one_stitcher[key] = stitcher[key][i]
+            if reader is not None:
+                one_stitcher['canvas_image'] = reader.read(one_stitcher['canvas_image'])
+            one_image, = stitch_node.inpaint_stitch_single_image(one_stitcher, inpainted_image[b].unsqueeze(0))
+            yield one_image.squeeze(0)
+    finally:
+        if reader is not None:
+            reader.close()
+
+
 class InpaintStitchImproved:
     """
     ComfyUI-InpaintCropAndStitch
@@ -1321,7 +1395,11 @@ class InpaintStitchImproved:
             "required": {
                 "stitcher": ("STITCHER",),
                 "inpainted_image": ("IMAGE",),
-            }
+            },
+            "optional": {
+                # optional so saved workflows and API prompts without it keep working
+                "cleanup_disk": ("BOOLEAN", {"default": True, "tooltip": "Only for a stitcher made with stitcher_storage=disk: delete its canvas file once every frame is stitched. Inpaint Crop then re-runs on the next queue (and everything after it). Turn off while iterating on nodes after the crop so the cached crop stays usable."}),
+            },
         }
 
     CATEGORY = "inpaint"
@@ -1333,35 +1411,19 @@ class InpaintStitchImproved:
     FUNCTION = "inpaint_stitch"
 
 
-    def inpaint_stitch(self, stitcher, inpainted_image):
-        inpainted_image = inpainted_image.clone()
-        results = []
-
-        batch_size = inpainted_image.shape[0]
-        assert len(stitcher['cropped_to_canvas_x']) == batch_size or len(stitcher['cropped_to_canvas_x']) == 1, "Stitch batch size doesn't match image batch size"
-        override = False
-        if len(stitcher['cropped_to_canvas_x']) != batch_size and len(stitcher['cropped_to_canvas_x']) == 1:
-            override = True
-        for b in range(batch_size):
-            one_image = inpainted_image[b]
-            one_stitcher = {}
-            for key in ['downscale_algorithm', 'upscale_algorithm', 'blend_pixels']:
-                one_stitcher[key] = stitcher[key]
-            for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend', 'subpixel_x', 'subpixel_y']:
-                if key not in stitcher: # stitchers made before subpixel support
-                    continue
-                if override: # One stitcher for many images, always read 0.
-                    one_stitcher[key] = stitcher[key][0]
-                else:
-                    one_stitcher[key] = stitcher[key][b]
-            one_image = one_image.unsqueeze(0)
-            one_image, = self.inpaint_stitch_single_image(one_stitcher, one_image)
-            one_image = one_image.squeeze(0)
-            one_image = one_image.clone()
-            results.append(one_image)
-
-        result_batch = torch.stack(results, dim=0)
-
+    def inpaint_stitch(self, stitcher, inpainted_image, cleanup_disk=True):
+        # Fill one preallocated batch: a list of frames followed by torch.stack would hold
+        # the full-size result twice at the peak.
+        result_batch = None
+        total = stitch_frame_count(stitcher, inpainted_image)
+        for b, frame in enumerate(iter_stitched_frames(self, stitcher, inpainted_image)):
+            if result_batch is None:
+                result_batch = torch.empty((total,) + tuple(frame.shape), dtype=frame.dtype, device=frame.device)
+            result_batch[b] = frame
+        if result_batch is None:
+            raise ValueError("Inpaint Stitch: inpainted_image is an empty batch")
+        if cleanup_disk:
+            discard_canvas_file(stitcher)
         return (result_batch,)
 
     def inpaint_stitch_single_image(self, stitcher, inpainted_image):
@@ -1387,3 +1449,68 @@ class InpaintStitchImproved:
         output_image = stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm, sub_x, sub_y)
 
         return (output_image,)
+
+
+class InpaintStitchToDisk:
+    """
+    Inpaint Stitch that streams the stitched frames straight into a VideoHelperSuite disk
+    clip (VHS_DISK_MEDIA) instead of returning an IMAGE batch, so the full-size result is
+    never held in RAM: one frame at a time goes to ffmpeg. Connect the output to
+    VHS_DiskCombine / VHS_SplitDisk / the other VHS disk nodes.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+                "inpainted_image": ("IMAGE",),
+                "frame_rate": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 1000.0, "step": 0.001}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "max": 1000000, "step": 1, "tooltip": "Stitch and write only the first N frames, e.g. to drop frames that were padded on to reach a frame-count grid. 0 = all."}),
+                "cleanup_disk": ("BOOLEAN", {"default": True, "tooltip": "Only for a stitcher made with stitcher_storage=disk: delete its canvas file once every frame is stitched. Inpaint Crop then re-runs on the next queue (and everything after it). Turn off while iterating on nodes after the crop so the cached crop stays usable."}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+            },
+        }
+
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Stitches Inpaint Crop results back into the original frames and writes them to a VHS disk clip, one frame at a time"
+
+    RETURN_TYPES = ("VHS_DISK_MEDIA", "INT")
+    RETURN_NAMES = ("disk", "count")
+
+    FUNCTION = "inpaint_stitch_to_disk"
+
+    def inpaint_stitch_to_disk(self, stitcher, inpainted_image, frame_rate, max_frames=0, cleanup_disk=True, unique_id=None, prompt=None):
+        vhs = vhs_disk_module()
+        total = stitch_frame_count(stitcher, inpainted_image, max_frames)
+        if total <= 0:
+            raise ValueError("Inpaint Stitch to Disk: inpainted_image is an empty batch")
+        stitch_node = InpaintStitchImproved()
+        out_path = vhs.new_clip_path("", unique_id, "stitch")
+        pbar = comfy.utils.ProgressBar(total)
+        writer = None
+        try:
+            for frame in iter_stitched_frames(stitch_node, stitcher, inpainted_image, max_frames):
+                if writer is None:
+                    writer = vhs._FfmpegFrameWriter(out_path, frame.shape[1], frame.shape[0], frame_rate, "auto")
+                writer.write_hwc(frame)
+                pbar.update(1)
+            media = writer.close()
+        except BaseException:
+            if writer is not None:
+                try:
+                    writer.proc.kill()
+                    writer.proc.wait()
+                except Exception:
+                    pass
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+            raise
+        if cleanup_disk:
+            discard_canvas_file(stitcher)
+        media = vhs.as_working_media(media, prompt, unique_id)
+        return (media, media["count"])
